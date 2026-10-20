@@ -1,0 +1,5 @@
+{
+  "name": "claude-cache-status",
+  "owner": { "name": "Glubin-yep" },
+  "plugins": [{ "name": "cache-status", "source": "./" }]
+}
