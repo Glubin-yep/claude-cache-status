@@ -2,6 +2,8 @@ export type CacheInfo = { hit: number; read: number; written: number; at: number
 export type CtxInfo = { tokens: number; window: number; percent: number; compactAt: number | null }
 export type LimitInfo = { kind: string; percent: number; resetsAt: number | null }
 export type Totals = { read: number; written: number; cost: number | null }
+export type CodexWindow = { percent: number; windowMin: number; resetsAt: number | null }
+export type CodexInfo = { primary: CodexWindow | null; secondary: CodexWindow | null; plan: string | null; at: number }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -14,6 +16,7 @@ declare module 'claude-code' {
       totals: Totals
       isCompact: boolean
       isAlert: boolean
+      codex: CodexInfo | null
     }
   }
 }

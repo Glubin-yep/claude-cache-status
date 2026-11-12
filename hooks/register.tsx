@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { CacheInfo, CtxInfo, LimitInfo, Totals } from '../types'
+import type { CacheInfo, CodexInfo, CodexWindow, CtxInfo, LimitInfo, Totals } from '../types'
 
 const TTL_MS = 60 * 60 * 1000
 const HOT_MS = 10 * 60 * 1000
@@ -10,8 +10,13 @@ const WARN_MS = 5 * 60 * 1000
 const SPARK = '▁▂▃▄▅▆▇█'
 
 // The SVG strip: one row of cells. It scales down to the band's width.
-const STRIP_W = 760
+const STRIP_MIN_W = 760
+const CELL_W = 118
 const STRIP_H = 60
+
+// Codex writes a rate-limit snapshot into its session logs on every turn.
+const CODEX_EVERY_MS = 60 * 1000
+const CODEX_MARK = '"limit_id":"codex"'
 
 // SVG cannot read the theme; these are GitHub-dark tones (the user runs dark).
 const HEX: Record<string, string> = {
@@ -36,9 +41,16 @@ const limits = atom({ plugin: 'cache-status', key: 'limits' } as const, [])
 const totals = atom({ plugin: 'cache-status', key: 'totals' } as const, { read: 0, written: 0, cost: null })
 const isCompact = atom({ plugin: 'cache-status', key: 'isCompact' } as const, false)
 const isAlert = atom({ plugin: 'cache-status', key: 'isAlert' } as const, false)
+const codex = atom({ plugin: 'cache-status', key: 'codex' } as const, null)
 
 // Module-local: reset on reload, which at worst repeats one toast.
 let warnedFor = 0
+// Codex reader: its home (undefined until asked, null when there is none),
+// the rollout last parsed, and when it last looked.
+let codexHome: string | null | undefined
+let codexSeen = ''
+let codexCheckedAt = 0
+let codexBusy = false
 
 function fmt(n: number) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
@@ -80,6 +92,30 @@ function limitName(kind: string) {
   return kind.toUpperCase()
 }
 
+function windowName(min: number) {
+  if (min === 300) return '5H'
+  if (min === 10080) return 'WEEK'
+  if (min > 0 && min % 1440 === 0) return `${min / 1440}D`
+  if (min > 0 && min % 60 === 0) return `${min / 60}H`
+  return `${min}M`
+}
+
+// A window whose reset time has passed is back at 0%, whatever the last
+// snapshot said: Codex only writes a new one when it is used.
+function codexWindow(w: CodexWindow, t: number) {
+  const isReset = w.resetsAt !== null && w.resetsAt <= t
+  return {
+    name: windowName(w.windowMin),
+    percent: isReset ? 0 : Math.round(w.percent),
+    unit: isReset ? 'reset' : w.resetsAt === null ? '' : `↻ ${dur(w.resetsAt - t)}`,
+  }
+}
+
+function codexWindows(cx: CodexInfo | null, t: number) {
+  if (cx === null) return []
+  return [cx.primary, cx.secondary].filter((w): w is CodexWindow => w !== null).map(w => codexWindow(w, t))
+}
+
 function cacheState(sinceMs: number) {
   const left = TTL_MS - sinceMs
   if (left <= 0) return { icon: '❄', label: 'cold', color: 'blue', left: 0 }
@@ -119,6 +155,7 @@ function meterSvg(m: Meter, x: number, y: number, w: number) {
 }
 
 function stripSvg(cells: Cell[]) {
+  const STRIP_W = Math.max(STRIP_MIN_W, cells.length * CELL_W)
   const w = STRIP_W / cells.length
   const pad = 14
   let body = ''
@@ -138,7 +175,16 @@ function stripSvg(cells: Cell[]) {
   )
 }
 
-function buildCells(c: CacheInfo, t: number, alert: boolean, history: number[], x: CtxInfo | null, ls: LimitInfo[], tot: Totals) {
+function buildCells(
+  c: CacheInfo,
+  t: number,
+  alert: boolean,
+  history: number[],
+  x: CtxInfo | null,
+  ls: LimitInfo[],
+  tot: Totals,
+  cx: CodexInfo | null,
+) {
   const st = cacheState(Math.max(0, t - c.at))
   const cells: Cell[] = [
     {
@@ -176,6 +222,16 @@ function buildCells(c: CacheInfo, t: number, alert: boolean, history: number[], 
       valueColor: HEX[load(l.percent)],
       unit: l.resetsAt === null ? '' : `↻ ${dur(l.resetsAt - t)}`,
       meter: { kind: 'bar', frac: l.percent / 100, color: load(l.percent), marker: null },
+    })
+  }
+  for (const w of codexWindows(cx, t)) {
+    cells.push({
+      label: `CODEX ${w.name}`,
+      labelColor: MUTED,
+      value: `${w.percent}%`,
+      valueColor: HEX[load(w.percent)],
+      unit: w.unit,
+      meter: { kind: 'bar', frac: w.percent / 100, color: load(w.percent), marker: null },
     })
   }
   const cachedFrac = tot.read + tot.written > 0 ? tot.read / (tot.read + tot.written) : 0
@@ -216,10 +272,155 @@ async function refreshUsage($: any, withBreakdown: boolean) {
   await update($, totals, t => ({ ...t, cost }))
 }
 
+// Runs the first command line that starts: pwsh, Windows PowerShell, then sh.
+async function runFirst($: any, pwsh: string, posix: string[]): Promise<string | null> {
+  const tries = [
+    ['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', pwsh],
+    ['powershell', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', pwsh],
+    posix,
+  ]
+  for (const argv of tries) {
+    try {
+      const r = await $.process.run(argv, { timeoutMs: 20000 })
+      return r.exitCode === 0 ? r.stdout : null
+    } catch {
+      // Not installed here: try the next one.
+    }
+  }
+  return null
+}
+
+const psQuote = (s: string) => `'${s.replace(/'/g, "''")}'`
+
+type Rollout = { path: string; mtimeMs: number; size: number }
+
+// The newest rollout files under sessions/YYYY/MM/DD, newest first.
+async function recentRollouts($: any, home: string): Promise<Rollout[]> {
+  const sep = home.includes('\\') ? '\\' : '/'
+  const join = (...parts: string[]) => parts.join(sep)
+  const numbered = async (dir: string): Promise<string[]> => {
+    const es: any[] = await $.fs.list(dir).catch(() => [])
+    return es
+      .filter(k => k.kind === 'dir' && /^\d+$/.test(k.name))
+      .map(k => k.name)
+      .sort()
+      .reverse()
+  }
+  const root = join(home.replace(/[\\/]+$/, ''), 'sessions')
+  const days: string[] = []
+  for (const y of (await numbered(root)).slice(0, 2)) {
+    for (const m of (await numbered(join(root, y))).slice(0, 2)) {
+      for (const d of (await numbered(join(root, y, m))).slice(0, 2)) days.push(join(root, y, m, d))
+    }
+  }
+  days.sort().reverse()
+  const files: Rollout[] = []
+  for (const dir of days.slice(0, 2)) {
+    const es: any[] = await $.fs.list(dir).catch(() => [])
+    for (const k of es) {
+      if (k.kind === 'file' && k.name.startsWith('rollout-') && k.name.endsWith('.jsonl')) {
+        files.push({ path: join(dir, k.name), mtimeMs: k.mtimeMs, size: k.size })
+      }
+    }
+  }
+  return files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 3)
+}
+
+// The last line of a rollout that carries a Codex rate-limit snapshot.
+async function lastCodexLine($: any, f: Rollout): Promise<string | null> {
+  if (f.size < 3.5 * 1024 * 1024) {
+    const text: string = await $.fs.read(f.path).catch(() => '')
+    const i = text.lastIndexOf(CODEX_MARK)
+    if (i < 0) return null
+    const start = text.lastIndexOf('\n', i) + 1
+    const end = text.indexOf('\n', i)
+    return text.slice(start, end < 0 ? text.length : end)
+  }
+  // Too big for one $.fs.read: read its last 4 MB (Get-Content -Tail crawls
+  // on long lines), and scan the whole file only if that has no whole line.
+  const p = psQuote(f.path)
+  const m = psQuote(CODEX_MARK)
+  const out = await runFirst(
+    $,
+    `$p = ${p}; $m = ${m}; $l = $null; ` +
+      `$fs = [IO.File]::Open($p, 'Open', 'Read', 'ReadWrite'); ` +
+      `try { $len = $fs.Length; $n = [int][Math]::Min($len, 4MB); [void]$fs.Seek(-$n, 'End'); ` +
+      `$b = New-Object byte[] $n; $o = 0; while ($o -lt $n) { $r = $fs.Read($b, $o, $n - $o); if ($r -le 0) { break }; $o += $r }; ` +
+      `$t = [Text.Encoding]::UTF8.GetString($b, 0, $o); $i = $t.LastIndexOf($m); ` +
+      `if ($i -ge 0) { $s = $t.LastIndexOf([char]10, $i) + 1; $e = $t.IndexOf([char]10, $i); if ($e -lt 0) { $e = $t.Length }; ` +
+      `if ($s -gt 0 -or $n -eq $len) { $l = $t.Substring($s, $e - $s) } } } finally { $fs.Close() }; ` +
+      `if (-not $l) { foreach ($x in [IO.File]::ReadLines($p)) { if ($x.Contains($m)) { $l = $x } } }; $l`,
+    ['sh', '-c', 'l=$(tail -n 400 "$1" | grep -F "$2" | tail -n 1); [ -n "$l" ] || l=$(grep -F "$2" "$1" | tail -n 1); printf %s "$l"', 'sh', f.path, CODEX_MARK],
+  )
+  const line = out?.trim() ?? ''
+  return line === '' ? null : line
+}
+
+function parseCodex(line: string): CodexInfo | null {
+  try {
+    const ev = JSON.parse(line)
+    const rl = ev?.payload?.rate_limits
+    if (!rl) return null
+    const at = Date.parse(ev.timestamp) || 0
+    const win = (w: any): CodexWindow | null => {
+      if (!w || typeof w.used_percent !== 'number') return null
+      const resetsAt =
+        typeof w.resets_at === 'number'
+          ? w.resets_at * 1000
+          : typeof w.resets_in_seconds === 'number' && at > 0
+            ? at + w.resets_in_seconds * 1000
+            : null
+      return { percent: w.used_percent, windowMin: w.window_minutes ?? 0, resetsAt }
+    }
+    const v: CodexInfo = { primary: win(rl.primary), secondary: win(rl.secondary), plan: rl.plan_type ?? null, at }
+    return v.primary === null && v.secondary === null ? null : v
+  } catch {
+    return null
+  }
+}
+
+async function refreshCodex($: any, t: number) {
+  if (codexBusy || t - codexCheckedAt < CODEX_EVERY_MS) return
+  codexBusy = true
+  codexCheckedAt = t
+  try {
+    if (codexHome === undefined) {
+      const out = await runFirst(
+        $,
+        `if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }`,
+        ['sh', '-c', 'printf %s "${CODEX_HOME:-$HOME/.codex}"'],
+      )
+      codexHome = out?.trim() || null
+    }
+    if (!codexHome) return
+    const files = await recentRollouts($, codexHome)
+    if (files.length === 0) return
+    const seen = `${files[0].path}|${files[0].mtimeMs}`
+    if (seen === codexSeen) return
+    codexSeen = seen
+    // A session that has not had a turn yet has no snapshot: fall back to the
+    // next newest.
+    for (const f of files) {
+      const line = await lastCodexLine($, f)
+      const v = line === null ? null : parseCodex(line)
+      if (v !== null) {
+        const prev = await read($, codex)
+        if (prev === null || v.at >= prev.at) await update($, codex, () => v)
+        return
+      }
+    }
+  } catch {
+    // Codex not installed or its logs unreadable: the band just leaves it out.
+  } finally {
+    codexBusy = false
+  }
+}
+
 async function tick($: any) {
   const t = await $.clock.now()
   await update($, now, () => t)
   await refreshUsage($, false)
+  await refreshCodex($, t)
   const c = await read($, info)
   if (c && warnedFor !== c.at) {
     const left = TTL_MS - (t - c.at)
@@ -238,6 +439,7 @@ export const register: Register = on => {
     $.ui.status(undefined)
     await $.command.register({ name: 'cache', description: 'Toggle the cache status band between full and compact' })
     $.clock.every(15000, () => tick($))
+    void $.clock.now().then((t: number) => refreshCodex($, t))
     return next(e)
   })
 
@@ -292,8 +494,9 @@ export const register: Register = on => {
     const tot = await read($, totals)
     const compact = await read($, isCompact)
     const alert = await read($, isAlert)
+    const cx = await read($, codex)
 
-    const { cells, st } = buildCells(c, t, alert, history, x, ls, tot)
+    const { cells, st } = buildCells(c, t, alert, history, x, ls, tot, cx)
     const toggle = <Button key="toggle" label={compact ? '▸' : '▾'} onPress={() => update($, isCompact, v => !v)} />
 
     if (Svg && !compact) {
@@ -333,6 +536,12 @@ export const register: Register = on => {
             <Box key={l.kind} flexDirection="row">
               {sep(`l${l.kind}`)}
               <Text color={load(l.percent)} bold>{`${limitShort(l.kind)} ${Math.round(l.percent)}%`}</Text>
+            </Box>
+          ))}
+          {codexWindows(cx, t).map(w => (
+            <Box key={`cx${w.name}`} flexDirection="row">
+              {sep(`cx${w.name}`)}
+              <Text color={load(w.percent)} bold>{`cx ${w.name.toLowerCase()} ${w.percent}%`}</Text>
             </Box>
           ))}
           {tot.cost !== null && sep('c')}
