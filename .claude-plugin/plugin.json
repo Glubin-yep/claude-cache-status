@@ -1,1 +1,1 @@
-{ "name": "cache-status", "version": "0.4.0", "description": "Band above the prompt: prompt cache hits and TTL, context window, Claude and Codex rate limits, and cost.", "types": "./types/index.d.ts" }
+{ "name": "cache-status", "version": "0.5.0", "description": "Band above the prompt: prompt cache hits and TTL, context window, Claude and Codex rate limits, and cost.", "types": "./types/index.d.ts" }

@@ -16,6 +16,11 @@ const STRIP_H = 60
 
 // Codex writes a rate-limit snapshot into its session logs on every turn.
 const CODEX_EVERY_MS = 60 * 1000
+const CODEX_DAYS = 7
+// What the Codex app itself asks for its limits (codex-rs/backend-client):
+// account-wide, so it counts use on other devices and in the cloud too.
+const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+const CODEX_SERVER_RETRY_MS = 5 * 60 * 1000
 const CODEX_MARK = '"limit_id":"codex"'
 
 // SVG cannot read the theme; these are GitHub-dark tones (the user runs dark).
@@ -46,10 +51,14 @@ const codex = atom({ plugin: 'cache-status', key: 'codex' } as const, null)
 // Module-local: reset on reload, which at worst repeats one toast.
 let warnedFor = 0
 // Codex reader: its home (undefined until asked, null when there is none),
-// the rollout last parsed, and when it last looked.
+// each recent rollout's size and snapshot when last read, and when it last
+// looked. Codex appends to a rollout without moving its modification time,
+// so the size is what says a log grew.
 let codexHome: string | null | undefined
-let codexSeen = ''
+const codexFiles = new Map<string, { size: number; snap: CodexInfo | null }>()
 let codexCheckedAt = 0
+// After a failed server request, the logs alone until this time.
+let codexServerRetryAt = 0
 let codexBusy = false
 
 function fmt(n: number) {
@@ -294,7 +303,8 @@ const psQuote = (s: string) => `'${s.replace(/'/g, "''")}'`
 
 type Rollout = { path: string; mtimeMs: number; size: number }
 
-// The newest rollout files under sessions/YYYY/MM/DD, newest first.
+// Every rollout file in the most recent day folders under sessions/YYYY/MM/DD,
+// sized by stat (a listing's size can lag behind a file still open).
 async function recentRollouts($: any, home: string): Promise<Rollout[]> {
   const sep = home.includes('\\') ? '\\' : '/'
   const join = (...parts: string[]) => parts.join(sep)
@@ -310,20 +320,22 @@ async function recentRollouts($: any, home: string): Promise<Rollout[]> {
   const days: string[] = []
   for (const y of (await numbered(root)).slice(0, 2)) {
     for (const m of (await numbered(join(root, y))).slice(0, 2)) {
-      for (const d of (await numbered(join(root, y, m))).slice(0, 2)) days.push(join(root, y, m, d))
+      for (const d of await numbered(join(root, y, m))) days.push(join(root, y, m, d))
     }
   }
   days.sort().reverse()
   const files: Rollout[] = []
-  for (const dir of days.slice(0, 2)) {
+  for (const dir of days.slice(0, CODEX_DAYS)) {
     const es: any[] = await $.fs.list(dir).catch(() => [])
     for (const k of es) {
       if (k.kind === 'file' && k.name.startsWith('rollout-') && k.name.endsWith('.jsonl')) {
-        files.push({ path: join(dir, k.name), mtimeMs: k.mtimeMs, size: k.size })
+        const path = join(dir, k.name)
+        const st = await $.fs.stat(path).catch(() => null)
+        files.push({ path, mtimeMs: k.mtimeMs, size: st ? st.size : k.size })
       }
     }
   }
-  return files.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 3)
+  return files
 }
 
 // The last line of a rollout that carries a Codex rate-limit snapshot.
@@ -379,6 +391,44 @@ function parseCodex(line: string): CodexInfo | null {
   }
 }
 
+// Asks the server, with the login Codex keeps in auth.json; null when there
+// is no ChatGPT login or the request fails. The token is only read here and
+// sent to chatgpt.com; refreshing it is Codex's own job.
+async function fetchCodexUsage($: any, home: string, t: number): Promise<CodexInfo | null> {
+  const sep = home.includes('\\') ? '\\' : '/'
+  const auth = JSON.parse(await $.fs.read(`${home.replace(/[\\/]+$/, '')}${sep}auth.json`))
+  const token = auth?.tokens?.access_token
+  const account = auth?.tokens?.account_id
+  if (typeof token !== 'string' || token === '') return null
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/json',
+    'User-Agent': 'codex-cli',
+  }
+  if (typeof account === 'string' && account !== '') headers['chatgpt-account-id'] = account
+  const r = await $.http.fetch(CODEX_USAGE_URL, { headers })
+  if (!r.ok) return null
+  const body = JSON.parse(r.text)
+  const rl = body?.rate_limit
+  const win = (w: any): CodexWindow | null => {
+    if (!w || typeof w.used_percent !== 'number') return null
+    const resetsAt =
+      typeof w.reset_at === 'number'
+        ? w.reset_at * 1000
+        : typeof w.reset_after_seconds === 'number'
+          ? t + w.reset_after_seconds * 1000
+          : null
+    return { percent: w.used_percent, windowMin: Math.round((w.limit_window_seconds ?? 0) / 60), resetsAt }
+  }
+  const v: CodexInfo = {
+    primary: win(rl?.primary_window),
+    secondary: win(rl?.secondary_window),
+    plan: typeof body?.plan_type === 'string' ? body.plan_type : null,
+    at: t,
+  }
+  return v.primary === null && v.secondary === null ? null : v
+}
+
 async function refreshCodex($: any, t: number) {
   if (codexBusy || t - codexCheckedAt < CODEX_EVERY_MS) return
   codexBusy = true
@@ -393,21 +443,33 @@ async function refreshCodex($: any, t: number) {
       codexHome = out?.trim() || null
     }
     if (!codexHome) return
-    const files = await recentRollouts($, codexHome)
-    if (files.length === 0) return
-    const seen = `${files[0].path}|${files[0].mtimeMs}`
-    if (seen === codexSeen) return
-    codexSeen = seen
-    // A session that has not had a turn yet has no snapshot: fall back to the
-    // next newest.
-    for (const f of files) {
-      const line = await lastCodexLine($, f)
-      const v = line === null ? null : parseCodex(line)
-      if (v !== null) {
-        const prev = await read($, codex)
-        if (prev === null || v.at >= prev.at) await update($, codex, () => v)
+    if (t >= codexServerRetryAt) {
+      const live = await fetchCodexUsage($, codexHome, t).catch(() => null)
+      if (live !== null) {
+        await update($, codex, () => live)
         return
       }
+      codexServerRetryAt = t + CODEX_SERVER_RETRY_MS
+    }
+    // No server answer: the newest snapshot Codex wrote to its own logs, which
+    // misses use outside this computer. Re-read only the logs whose size changed; the newest snapshot by its own
+    // timestamp wins, whichever log it is in (a long session's log can be
+    // older than a subagent's that has gone quiet).
+    let best: CodexInfo | null = null
+    for (const f of await recentRollouts($, codexHome)) {
+      const known = codexFiles.get(f.path)
+      let snap = known ? known.snap : null
+      if (known === undefined || known.size !== f.size) {
+        const line = await lastCodexLine($, f)
+        snap = line === null ? null : parseCodex(line)
+        codexFiles.set(f.path, { size: f.size, snap })
+      }
+      if (snap !== null && (best === null || snap.at > best.at)) best = snap
+    }
+    const v = best
+    if (v !== null) {
+      const prev = await read($, codex)
+      if (prev === null || (v.at >= prev.at && JSON.stringify(v) !== JSON.stringify(prev))) await update($, codex, () => v)
     }
   } catch {
     // Codex not installed or its logs unreadable: the band just leaves it out.

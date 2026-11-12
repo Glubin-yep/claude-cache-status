@@ -4,7 +4,12 @@ A Claude Code mod: a band above the prompt showing prompt-cache hits and TTL, co
 
 ## Codex limits
 
-If the [Codex CLI](https://github.com/openai/codex) is installed, the band also shows its 5-hour and weekly limits. Codex writes a rate-limit snapshot to its session logs (`~/.codex/sessions/`, or `$CODEX_HOME/sessions`) on every turn; the mod reads the newest one once a minute. A window whose reset time has passed shows 0% until Codex writes a new snapshot. Large logs are tail-read through `pwsh`/`powershell` on Windows or `sh` elsewhere. Without Codex, those cells are left out.
+If [Codex](https://github.com/openai/codex) is installed and signed in with ChatGPT, the band also shows its 5-hour and weekly limits, once a minute.
+
+- **From the server.** The mod asks `https://chatgpt.com/backend-api/wham/usage`, the endpoint the Codex app itself uses, with the login Codex keeps in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`). These limits are account-wide, so they include use in the cloud, in ChatGPT and on other devices. The token is only read and sent to chatgpt.com; the mod never stores, logs or refreshes it (Codex refreshes it itself). The endpoint is undocumented and may change.
+- **From the logs, as a fallback.** When the request fails (no ChatGPT login, an expired token, a changed API), the mod reads the newest rate-limit snapshot Codex wrote to its session logs (`~/.codex/sessions/`). Those only see use on this computer, and a window whose reset time has passed shows 0% until Codex writes a new snapshot. Large logs are tail-read through `pwsh`/`powershell` on Windows or `sh` elsewhere.
+
+Without Codex, those cells are left out.
 
 ## Install
 
